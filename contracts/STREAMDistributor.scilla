@@ -17,7 +17,6 @@ let one_msg =
 
 (* Error events *)
 type Error =
-| CodeNotSender
 | CodeNotOwner
 | CodeNotPendingOwner
 | CodePendingOwnerNotEmpty
@@ -29,13 +28,12 @@ let make_error =
   fun (result : Error) =>
     let result_code =
       match result with
-      | CodeNotSender             => Int32 -1
-      | CodeNotOwner              => Int32 -2
-      | CodeNotPendingOwner       => Int32 -3
-      | CodePendingOwnerNotEmpty  => Int32 -4
-      | CodeInvalidEpoch          => Int32 -5
-      | CodeInvalidProof          => Int32 -6
-      | CodeAlreadyClaimed        => Int32 -7
+      | CodeNotOwner              => Int32 -1
+      | CodeNotPendingOwner       => Int32 -2
+      | CodePendingOwnerNotEmpty  => Int32 -3
+      | CodeInvalidEpoch          => Int32 -4
+      | CodeInvalidProof          => Int32 -5
+      | CodeAlreadyClaimed        => Int32 -6
       end
     in
     { _exception : "Error"; code : result_code }
