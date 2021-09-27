@@ -74,6 +74,7 @@ let hash_leaves =
     end
 
 let zero = Uint128 0
+let one = Uint32 1
 let yes = True
 let none = None {ByStr20}
 
@@ -86,8 +87,7 @@ let none = None {ByStr20}
 contract STREAMDistributor
 (
   stream_token_contract : ByStr20,
-  init_owner : ByStr20,
-  initial_epoch: Uint32
+  init_owner : ByStr20
 )
 
 (* Mutable fields *)
@@ -100,6 +100,8 @@ field merkle_roots : Map Uint32 ByStr32 (* epoch num -> merkle root *)
 
 field claimed_leafs : Map Uint32 (Map ByStr32 Bool) (* epoch num -> leaf hash -> True *)
   = Emp Uint32 (Map ByStr32 Bool)
+
+field next_epoch_number : Uint32 = Uint32 0
 
 (**************************************)
 (*             Procedures             *)
@@ -165,26 +167,12 @@ procedure IsUnclaimed(epoch_number: Uint32, leaf_hash: ByStr32)
 end
 
 procedure IsValidEpochToSet(epoch_number: Uint32)
-  is_initial_epoch = builtin eq epoch_number initial_epoch;
-  match is_initial_epoch with
+  next <- next_epoch_number;
+  is_valid_epoch = builtin eq epoch_number next;
+  match is_valid_epoch with
   | True => (* noop *)
   | False =>
-    prev_epoch =
-      let one = Uint32 1 in
-      builtin sub epoch_number one;
-    previous_root <- merkle_roots[prev_epoch];
-    match previous_root with
-    | Some val =>
-    | None =>
-      err = CodeInvalidEpoch; (* previous root not set*)
-      ThrowError err
-    end
-  end;
-  current_root <- merkle_roots[epoch_number];
-  match current_root with
-  | None =>
-  | Some val =>
-    err = CodeInvalidEpoch; (* already set*)
+    err = CodeInvalidEpoch;
     ThrowError err
   end
 end
@@ -209,6 +197,23 @@ procedure VerifyInclusion(epoch_number: Uint32, leaf_hash: ByStr32, proof: List 
   end
 end
 
+procedure ValidateAndMarkClaim(claim: Claim)
+  match claim with
+  | Claim epoch_number leaf proof =>
+    match leaf with
+    | DistributionLeaf account amount =>
+      leaf_hash = hash_leaf leaf;
+
+      IsUnclaimed epoch_number leaf_hash;
+      VerifyInclusion epoch_number leaf_hash proof;
+
+      claimed_leafs[epoch_number][leaf_hash] := yes;
+      e = {_eventname : "Claimed"; epoch_number: epoch_number; data : leaf};
+      event e
+    end
+  end
+end
+
 procedure Distribute(recipient: ByStr20, amount: Uint128)
   msg_to_token = {_tag : "Transfer"; _recipient : stream_token_contract; _amount : zero;
                   to : recipient; amount : amount};
@@ -220,43 +225,98 @@ end
 (*             Transitions             *)
 (***************************************)
 
-(* @dev: Claims from a distribution for an epoch by providing proof of inclusion. *)
-(* @param epoch_number: The epoch number to claim from.                           *)
-(* @param account: The address to claim for.                                      *)
-(* @param amount: The amount of tokens to claim.                                  *)
-(* @param proof: The merkle inclusion proof for the claim.                        *)
-transition ClaimRaw(
-  epoch_number: Uint32,
+(* @dev: Claims from multiple epochs for a single account by providing proofs of inclusion.       *)
+(* @param amount: The amount of tokens to claim.                                                  *)
+(* @param claims: The claim data, which contains the epoch_number, amount and proof for the claim *)
+transition ClaimMulti(
   account: ByStr20,
-  amount: Uint128,
-  proof: List ByStr32
+  claims: List (Pair (Pair Uint32 Uint128) (List ByStr32)) (* ((epoch_number : Uint32, amount : Uint128), proof: List ByStr32) *)
 )
-  leaf = DistributionLeaf account amount;
-  claim = Claim epoch_number leaf proof;
-  msg_to_self = {_tag : "Claim"; _recipient : _this_address; _amount : zero;
-                 claim : claim };
-  msgs = one_msg msg_to_self;
-  send msgs
+  (* construct claim ADT list *)
+  c =
+    let map_fn = fun (claim: Pair (Pair Uint32 Uint128) (List ByStr32)) =>
+      match claim with
+      | Pair data proof =>
+        match data with
+        | Pair epoch_number amount =>
+          let leaf = DistributionLeaf account amount in
+          Claim epoch_number leaf proof
+        end
+      end in
+    let map = @list_map (Pair (Pair Uint32 Uint128) (List ByStr32)) Claim in
+    map map_fn claims;
+
+  (* check and mark all claims *)
+  forall c ValidateAndMarkClaim;
+
+  (* compute total *)
+  total =
+    let fold_fn = fun (t : Uint128) => fun (claim: Pair (Pair Uint32 Uint128) (List ByStr32)) =>
+      match claim with
+      | Pair data proof =>
+        match data with
+        | Pair epoch_number amount =>
+          builtin add t amount
+        end
+      end in
+    let fold = @list_foldl (Pair (Pair Uint32 Uint128) (List ByStr32)) Uint128 in
+    fold fold_fn zero claims;
+
+  (* distribute all at once *)
+  Distribute account total
 end
 
 (* @dev: Claims from a distribution for an epoch by providing proof of inclusion.               *)
 (* @param claim: The claim data, which contains the epoch number, leaf and proof for the claim. *)
 transition Claim(claim: Claim)
+  (* check and mark the claim *)
+  ValidateAndMarkClaim claim;
+
+  (* distribute the amount *)
   match claim with
   | Claim epoch_number leaf proof =>
     match leaf with
     | DistributionLeaf account amount =>
-      leaf_hash = hash_leaf leaf;
-
-      IsUnclaimed epoch_number leaf_hash;
-      VerifyInclusion epoch_number leaf_hash proof;
-      Distribute account amount;
-
-      claimed_leafs[epoch_number][leaf_hash] := yes;
-      e = {_eventname : "Claimed"; epoch_number: epoch_number; data : leaf};
-      event e
+      Distribute account amount
     end
   end
+end
+
+(* @dev: Sets the distribution merkle roots and claimed data for the next available epoch from a legacy distributor contract. Only can be called by the contract_owner. *)
+(* @param _merkle_roots: The map of merkle roots by epoch number *)
+(* @param _claimed_leafs: The map of claimed leafs by epoch number and address *)
+transition MigrateData(
+  legacy_contract: ByStr20 with contract
+    field merkle_roots: Map Uint32 ByStr32,
+    field claimed_leafs: Map Uint32 (Map ByStr32 Bool)
+  end
+)
+  IsOwner _sender;
+
+  epoch_number <- next_epoch_number;
+
+  maybe_root <- & legacy_contract.merkle_roots[epoch_number];
+  match maybe_root with
+  | None =>
+    err = CodeInvalidEpoch;
+    ThrowError err
+  | Some root =>
+    maybe_leafs <- & legacy_contract.claimed_leafs[epoch_number];
+    match maybe_leafs with
+    | None =>
+      err = CodeInvalidEpoch;
+      ThrowError err
+    | Some leafs =>
+      merkle_roots[epoch_number] := root;
+      claimed_leafs[epoch_number] := leafs
+    end
+  end;
+
+  new_epoch_number = builtin add one epoch_number;
+  next_epoch_number := new_epoch_number;
+
+  e = {_eventname : "DataMigrated"; epoch_number: epoch_number};
+  event e
 end
 
 (* @dev: Sets the distribution merkle root for the epoch. Only can be called by the contract_owner. Epochs must be set in order. *)
@@ -266,6 +326,8 @@ transition SetMerkleRoot(epoch_number: Uint32, merkle_root: ByStr32)
   IsOwner _sender;
   IsValidEpochToSet epoch_number;
   merkle_roots[epoch_number] := merkle_root;
+  new_epoch_number = builtin add one epoch_number;
+  next_epoch_number := new_epoch_number;
   e = {_eventname : "MerkleRootSet"; epoch_number : epoch_number; merkle_root : merkle_root};
   event e
 end
